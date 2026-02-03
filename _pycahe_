@@ -1,0 +1,1435 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from typing import Dict, List, Optional
+
+
+class AdditionalAugmentations:
+    def __init__(self, config):
+        self.config = config
+        self.sample_rate = config.sample_rate
+    
+    def apply_time_stretch(self, waveform, rate=1.0):
+        if rate == 1.0:
+            return waveform
+        
+        indices = torch.arange(0, waveform.shape[0], rate)
+        indices = indices.clamp(0, waveform.shape[0] - 1).long()
+        stretched = waveform[indices]
+        
+        return stretched
+    
+    def apply_pitch_shift(self, waveform, n_steps=0):
+        if n_steps == 0:
+            return waveform
+        
+        rate = 2 ** (n_steps / 12.0)
+        shifted = self.apply_time_stretch(waveform, 1.0 / rate)
+        
+        return shifted
+    
+    def add_white_noise(self, waveform, noise_level=0.005):
+        noise = torch.randn_like(waveform) * noise_level
+        return waveform + noise
+    
+    def add_colored_noise(self, waveform, noise_type='pink'):
+        noise = torch.randn_like(waveform)
+        
+        if noise_type == 'pink':
+            fft_noise = torch.fft.rfft(noise)
+            freqs = torch.arange(len(fft_noise))
+            fft_noise = fft_noise / torch.sqrt(freqs + 1)
+            noise = torch.fft.irfft(fft_noise, n=len(waveform))
+        elif noise_type == 'brown':
+            fft_noise = torch.fft.rfft(noise)
+            freqs = torch.arange(len(fft_noise))
+            fft_noise = fft_noise / (freqs + 1)
+            noise = torch.fft.irfft(fft_noise, n=len(waveform))
+        
+        return waveform + noise * 0.005
+    
+    def apply_room_impulse_response(self, waveform):
+        impulse_length = 1000
+        impulse = torch.exp(-torch.arange(impulse_length, dtype=torch.float32) / 100)
+        impulse = impulse * torch.randn(impulse_length) * 0.1
+        
+        convolved = F.conv1d(
+            waveform.unsqueeze(0).unsqueeze(0),
+            impulse.unsqueeze(0).unsqueeze(0),
+            padding=impulse_length // 2
+        )
+        
+        return convolved.squeeze()
+    
+    def apply_compression(self, waveform, threshold=0.5, ratio=4.0):
+        abs_waveform = torch.abs(waveform)
+        mask = abs_waveform > threshold
+        
+        compressed = waveform.clone()
+        compressed[mask] = torch.sign(waveform[mask]) * (
+            threshold + (abs_waveform[mask] - threshold) / ratio
+        )
+        
+        return compressed
+    
+    def apply_clipping(self, waveform, threshold=0.95):
+        return torch.clamp(waveform, -threshold, threshold)
+    
+    def apply_filtering(self, waveform, cutoff_low=None, cutoff_high=None):
+        fft_signal = torch.fft.rfft(waveform)
+        freqs = torch.fft.rfftfreq(len(waveform), 1.0 / self.sample_rate)
+        
+        if cutoff_low is not None:
+            fft_signal[freqs < cutoff_low] = 0
+        
+        if cutoff_high is not None:
+            fft_signal[freqs > cutoff_high] = 0
+        
+        filtered = torch.fft.irfft(fft_signal, n=len(waveform))
+        
+        return filtered
+    
+    def apply_random_gain(self, waveform, gain_range=(0.8, 1.2)):
+        gain = np.random.uniform(gain_range[0], gain_range[1])
+        return waveform * gain
+    
+    def apply_polarity_inversion(self, waveform):
+        return -waveform
+    
+    def apply_time_masking(self, waveform, max_mask_size=1600):
+        mask_size = np.random.randint(0, max_mask_size)
+        mask_start = np.random.randint(0, max(1, len(waveform) - mask_size))
+        masked = waveform.clone()
+        masked[mask_start:mask_start + mask_size] = 0
+        return masked
+    
+    def apply_spec_augment_on_waveform(self, waveform):
+        augmented = waveform.clone()
+        
+        if np.random.rand() < 0.5:
+            augmented = self.apply_time_masking(augmented)
+        
+        if np.random.rand() < 0.3:
+            augmented = self.add_white_noise(augmented)
+        
+        if np.random.rand() < 0.2:
+            augmented = self.apply_random_gain(augmented)
+        
+        return augmented
+
+
+class AdvancedFeatureExtraction:
+    def __init__(self, config):
+        self.config = config
+        self.sample_rate = config.sample_rate
+    
+    def extract_lfcc(self, waveform, n_lfcc=20):
+        n_fft = 512
+        hop_length = 160
+        
+        stft = torch.stft(
+            waveform,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            return_complex=True
+        )
+        
+        magnitude = torch.abs(stft)
+        power_spectrum = magnitude ** 2
+        
+        linear_filters = torch.linspace(0, self.sample_rate / 2, n_lfcc + 2)
+        filter_banks = []
+        
+        for i in range(1, n_lfcc + 1):
+            left = linear_filters[i - 1]
+            center = linear_filters[i]
+            right = linear_filters[i + 1]
+            
+            freqs = torch.linspace(0, self.sample_rate / 2, n_fft // 2 + 1)
+            
+            filter_bank = torch.zeros(n_fft // 2 + 1)
+            filter_bank[(freqs >= left) & (freqs < center)] = (
+                (freqs[(freqs >= left) & (freqs < center)] - left) / (center - left)
+            )
+            filter_bank[(freqs >= center) & (freqs < right)] = (
+                (right - freqs[(freqs >= center) & (freqs < right)]) / (right - center)
+            )
+            
+            filter_banks.append(filter_bank)
+        
+        filter_banks = torch.stack(filter_banks)
+        
+        lfcc = torch.matmul(filter_banks, power_spectrum)
+        lfcc = torch.log(lfcc + 1e-6)
+        
+        return lfcc
+    
+    def extract_cqt(self, waveform, n_bins=84, bins_per_octave=12):
+        fmin = 32.7
+        n_octaves = n_bins // bins_per_octave
+        
+        cqt_kernels = []
+        for k in range(n_bins):
+            freq = fmin * (2 ** (k / bins_per_octave))
+            window_length = int(self.sample_rate / freq)
+            
+            n = torch.arange(window_length, dtype=torch.float32)
+            kernel = torch.exp(-2j * np.pi * n / window_length)
+            kernel = kernel * torch.hann_window(window_length)
+            
+            cqt_kernels.append(kernel)
+        
+        cqt = []
+        for kernel in cqt_kernels:
+            conv_result = F.conv1d(
+                waveform.unsqueeze(0).unsqueeze(0),
+                kernel.real.unsqueeze(0).unsqueeze(0),
+                padding=len(kernel) // 2
+            )
+            cqt.append(torch.abs(conv_result))
+        
+        cqt = torch.cat(cqt, dim=1)
+        
+        return cqt
+    
+    def extract_spectral_features(self, waveform):
+        stft = torch.stft(
+            waveform,
+            n_fft=512,
+            hop_length=160,
+            return_complex=True
+        )
+        
+        magnitude = torch.abs(stft)
+        
+        spectral_centroid = torch.sum(
+            magnitude * torch.arange(magnitude.shape[0]).unsqueeze(1).float(),
+            dim=0
+        ) / (torch.sum(magnitude, dim=0) + 1e-6)
+        
+        spectral_rolloff = torch.zeros(magnitude.shape[1])
+        cumsum = torch.cumsum(magnitude, dim=0)
+        threshold = 0.85 * cumsum[-1]
+        for i in range(magnitude.shape[1]):
+            rolloff_idx = torch.where(cumsum[:, i] >= threshold[i])[0]
+            if len(rolloff_idx) > 0:
+                spectral_rolloff[i] = rolloff_idx[0].float()
+        
+        mean_mag = torch.mean(magnitude, dim=0, keepdim=True)
+        spectral_flatness = torch.exp(torch.mean(torch.log(magnitude + 1e-6), dim=0)) / (mean_mag + 1e-6)
+        
+        return {
+            'centroid': spectral_centroid,
+            'rolloff': spectral_rolloff,
+            'flatness': spectral_flatness
+        }
+    
+    def extract_zero_crossing_rate(self, waveform, frame_length=512, hop_length=160):
+        frames = waveform.unfold(0, frame_length, hop_length)
+        sign_changes = torch.abs(torch.diff(torch.sign(frames), dim=1))
+        zcr = torch.sum(sign_changes, dim=1) / (2.0 * frame_length)
+        return zcr
+    
+    def extract_energy(self, waveform, frame_length=512, hop_length=160):
+        frames = waveform.unfold(0, frame_length, hop_length)
+        energy = torch.sum(frames ** 2, dim=1)
+        return energy
+    
+    def extract_rms(self, waveform, frame_length=512, hop_length=160):
+        frames = waveform.unfold(0, frame_length, hop_length)
+        rms = torch.sqrt(torch.mean(frames ** 2, dim=1))
+        return rms
+
+
+class ContrastiveLearningModule(nn.Module):
+    def __init__(self, feature_dim=512, projection_dim=128, temperature=0.07):
+        super().__init__()
+        
+        self.projection_head = nn.Sequential(
+            nn.Linear(feature_dim, feature_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(feature_dim, projection_dim)
+        )
+        
+        self.temperature = temperature
+    
+    def forward(self, features):
+        projections = self.projection_head(features)
+        projections = F.normalize(projections, dim=1)
+        return projections
+    
+    def compute_loss(self, projections, labels):
+        batch_size = projections.shape[0]
+        
+        similarity = torch.matmul(projections, projections.T) / self.temperature
+        
+        mask = torch.eye(batch_size, device=projections.device).bool()
+        similarity.masked_fill_(mask, -9e15)
+        
+        positive_mask = labels.unsqueeze(0) == labels.unsqueeze(1)
+        positive_mask.fill_diagonal_(False)
+        
+        exp_sim = torch.exp(similarity)
+        
+        positive_similarity = similarity[positive_mask].view(batch_size, -1)
+        
+        if positive_similarity.numel() == 0:
+            return torch.tensor(0.0, device=projections.device)
+        
+        log_prob = positive_similarity - torch.log(exp_sim.sum(dim=1, keepdim=True))
+        
+        loss = -log_prob.mean()
+        
+        return loss
+
+
+class TripletLossModule(nn.Module):
+    def __init__(self, margin=1.0):
+        super().__init__()
+        self.margin = margin
+    
+    def forward(self, anchor, positive, negative):
+        distance_positive = F.pairwise_distance(anchor, positive)
+        distance_negative = F.pairwise_distance(anchor, negative)
+        
+        losses = F.relu(distance_positive - distance_negative + self.margin)
+        
+        return losses.mean()
+    
+    def mine_hard_negatives(self, features, labels):
+        batch_size = features.shape[0]
+        
+        distances = torch.cdist(features, features)
+        
+        hard_negatives = []
+        for i in range(batch_size):
+            negative_mask = labels != labels[i]
+            if negative_mask.sum() > 0:
+                negative_distances = distances[i][negative_mask]
+                hardest_idx = torch.argmin(negative_distances)
+                negative_indices = torch.where(negative_mask)[0]
+                hard_negatives.append(negative_indices[hardest_idx])
+            else:
+                hard_negatives.append(i)
+        
+        return torch.tensor(hard_negatives, device=features.device)
+
+
+class CenterLossModule(nn.Module):
+    def __init__(self, num_classes=2, feature_dim=512, alpha=0.5):
+        super().__init__()
+        
+        self.num_classes = num_classes
+        self.feature_dim = feature_dim
+        self.alpha = alpha
+        
+        self.centers = nn.Parameter(torch.randn(num_classes, feature_dim))
+    
+    def forward(self, features, labels):
+        batch_size = features.shape[0]
+        
+        centers_batch = self.centers[labels]
+        
+        loss = F.mse_loss(features, centers_batch)
+        
+        return loss
+    
+    def update_centers(self, features, labels):
+        with torch.no_grad():
+            for c in range(self.num_classes):
+                mask = labels == c
+                if mask.sum() > 0:
+                    class_features = features[mask]
+                    center_update = class_features.mean(dim=0)
+                    self.centers[c] = (1 - self.alpha) * self.centers[c] + self.alpha * center_update
+
+
+class MemoryBank:
+    def __init__(self, size=4096, feature_dim=512, device='cuda'):
+        self.size = size
+        self.feature_dim = feature_dim
+        self.device = device
+        
+        self.features = torch.zeros(size, feature_dim).to(device)
+        self.labels = torch.zeros(size, dtype=torch.long).to(device)
+        self.ptr = 0
+        self.is_full = False
+    
+    def update(self, features, labels):
+        batch_size = features.shape[0]
+        
+        if self.ptr + batch_size > self.size:
+            remaining = self.size - self.ptr
+            self.features[self.ptr:] = features[:remaining].detach()
+            self.labels[self.ptr:] = labels[:remaining]
+            
+            overflow = batch_size - remaining
+            self.features[:overflow] = features[remaining:].detach()
+            self.labels[:overflow] = labels[remaining:]
+            
+            self.ptr = overflow
+            self.is_full = True
+        else:
+            self.features[self.ptr:self.ptr + batch_size] = features.detach()
+            self.labels[self.ptr:self.ptr + batch_size] = labels
+            self.ptr += batch_size
+    
+    def get_all(self):
+        if self.is_full:
+            return self.features, self.labels
+        else:
+            return self.features[:self.ptr], self.labels[:self.ptr]
+    
+    def sample(self, n=256):
+        if self.is_full:
+            indices = torch.randperm(self.size)[:n]
+        else:
+            indices = torch.randperm(self.ptr)[:min(n, self.ptr)]
+        
+        return self.features[indices], self.labels[indices]
+
+
+class MomentumEncoder(nn.Module):
+    def __init__(self, base_encoder, momentum=0.999):
+        super().__init__()
+        
+        self.base_encoder = base_encoder
+        self.momentum_encoder = self._create_momentum_encoder()
+        self.momentum = momentum
+        
+        self._initialize_momentum_encoder()
+    
+    def _create_momentum_encoder(self):
+        import copy
+        return copy.deepcopy(self.base_encoder)
+    
+    def _initialize_momentum_encoder(self):
+        for param_b, param_m in zip(self.base_encoder.parameters(), 
+                                     self.momentum_encoder.parameters()):
+            param_m.data.copy_(param_b.data)
+            param_m.requires_grad = False
+    
+    def update_momentum_encoder(self):
+        for param_b, param_m in zip(self.base_encoder.parameters(),
+                                     self.momentum_encoder.parameters()):
+            param_m.data = param_m.data * self.momentum + param_b.data * (1 - self.momentum)
+    
+    def forward(self, x, use_momentum=False):
+        if use_momentum:
+            with torch.no_grad():
+                return self.momentum_encoder(x)
+        else:
+            return self.base_encoder(x)
+
+
+class DomainAdaptationLoss(nn.Module):
+    def __init__(self, num_domains=5):
+        super().__init__()
+        self.num_domains = num_domains
+    
+    def compute_mmd(self, source_features, target_features):
+        xx = torch.mm(source_features, source_features.t())
+        yy = torch.mm(target_features, target_features.t())
+        xy = torch.mm(source_features, target_features.t())
+        
+        rx = xx.diag().unsqueeze(0).expand_as(xx)
+        ry = yy.diag().unsqueeze(0).expand_as(yy)
+        
+        K_xx = torch.exp(-(rx.t() + rx - 2 * xx))
+        K_yy = torch.exp(-(ry.t() + ry - 2 * yy))
+        K_xy = torch.exp(-(rx.t() + ry - 2 * xy))
+        
+        mmd = K_xx.mean() + K_yy.mean() - 2 * K_xy.mean()
+        
+        return mmd
+    
+    def compute_coral(self, source_features, target_features):
+        d = source_features.shape[1]
+        
+        source_mean = source_features.mean(dim=0, keepdim=True)
+        target_mean = target_features.mean(dim=0, keepdim=True)
+        
+        source_centered = source_features - source_mean
+        target_centered = target_features - target_mean
+        
+        source_cov = torch.mm(source_centered.t(), source_centered) / (source_features.shape[0] - 1)
+        target_cov = torch.mm(target_centered.t(), target_centered) / (target_features.shape[0] - 1)
+        
+        coral_loss = torch.norm(source_cov - target_cov, p='fro') ** 2 / (4 * d * d)
+        
+        return coral_loss
+    
+    def compute_cmd(self, source_features, target_features, n_moments=5):
+        cmd_loss = 0.0
+        
+        for k in range(1, n_moments + 1):
+            source_moment = torch.mean(source_features ** k, dim=0)
+            target_moment = torch.mean(target_features ** k, dim=0)
+            cmd_loss += torch.norm(source_moment - target_moment, p=2)
+        
+        return cmd_loss
+
+
+class MultiTaskHead(nn.Module):
+    def __init__(self, feature_dim=512):
+        super().__init__()
+        
+        self.spoof_type_classifier = nn.Sequential(
+            nn.Linear(feature_dim, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(256, 10)
+        )
+        
+        self.quality_estimator = nn.Sequential(
+            nn.Linear(feature_dim, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, 1),
+            nn.Sigmoid()
+        )
+        
+        self.speaker_encoder = nn.Sequential(
+            nn.Linear(feature_dim, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, 128)
+        )
+    
+    def forward(self, features):
+        spoof_type = self.spoof_type_classifier(features)
+        quality_score = self.quality_estimator(features)
+        speaker_embedding = self.speaker_encoder(features)
+        
+        return {
+            'spoof_type': spoof_type,
+            'quality': quality_score,
+            'speaker_embedding': speaker_embedding
+        }
+
+
+class AttentionPooling(nn.Module):
+    def __init__(self, feature_dim=512):
+        super().__init__()
+        
+        self.attention_weights = nn.Sequential(
+            nn.Linear(feature_dim, feature_dim // 4),
+            nn.Tanh(),
+            nn.Linear(feature_dim // 4, 1)
+        )
+    
+    def forward(self, features):
+        if len(features.shape) == 2:
+            features = features.unsqueeze(1)
+        
+        weights = self.attention_weights(features)
+        weights = F.softmax(weights, dim=1)
+        
+        pooled = torch.sum(features * weights, dim=1)
+        
+        return pooled
+
+
+class TemporalConvolutionNetwork(nn.Module):
+    def __init__(self, input_dim=512, hidden_dim=256, num_layers=4, kernel_size=3):
+        super().__init__()
+        
+        self.layers = nn.ModuleList()
+        
+        for i in range(num_layers):
+            dilation = 2 ** i
+            padding = (kernel_size - 1) * dilation
+            
+            in_channels = input_dim if i == 0 else hidden_dim
+            
+            self.layers.append(nn.Sequential(
+                nn.Conv1d(in_channels, hidden_dim, kernel_size, 
+                         padding=padding, dilation=dilation),
+                nn.BatchNorm1d(hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Dropout(0.2)
+            ))
+    
+    def forward(self, x):
+        for layer in self.layers:
+            residual = x if x.shape[1] == layer[0].out_channels else None
+            x = layer(x)
+            if residual is not None:
+                x = x + residual
+        
+        return x
+
+
+class AdaptiveBatchNorm(nn.Module):
+    def __init__(self, num_features, num_domains=5):
+        super().__init__()
+        
+        self.num_domains = num_domains
+        
+        self.domain_bns = nn.ModuleList([
+            nn.BatchNorm1d(num_features) for _ in range(num_domains)
+        ])
+    
+    def forward(self, x, domain_id=0):
+        if domain_id >= self.num_domains:
+            domain_id = 0
+        
+        return self.domain_bns[domain_id](x)
+
+
+class UncertaintyEstimator(nn.Module):
+    def __init__(self, feature_dim=512):
+        super().__init__()
+        
+        self.fc = nn.Sequential(
+            nn.Linear(feature_dim, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(256, 1),
+            nn.Softplus()
+        )
+    
+    def forward(self, features):
+        uncertainty = self.fc(features)
+        return uncertainty
+    
+    def mcdropout_inference(self, model, x, num_samples=10):
+        model.train()
+        
+        predictions = []
+        for _ in range(num_samples):
+            with torch.no_grad():
+                pred = model(x)
+                predictions.append(pred)
+        
+        predictions = torch.stack(predictions)
+        
+        mean_pred = predictions.mean(dim=0)
+        std_pred = predictions.std(dim=0)
+        
+        return mean_pred, std_pred
+
+
+class EvidentialClassifier(nn.Module):
+    def __init__(self, feature_dim=512, num_classes=2):
+        super().__init__()
+        
+        self.fc = nn.Sequential(
+            nn.Linear(feature_dim, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(256, num_classes)
+        )
+    
+    def forward(self, features):
+        evidence = F.softplus(self.fc(features))
+        alpha = evidence + 1
+        
+        S = torch.sum(alpha, dim=1, keepdim=True)
+        prob = alpha / S
+        uncertainty = num_classes / S
+        
+        return prob, uncertainty, alpha
+    
+    def edl_loss(self, alpha, y, epoch, num_epochs, annealing_step=10):
+        S = torch.sum(alpha, dim=1, keepdim=True)
+        
+        A = torch.sum((y - alpha / S) ** 2 + alpha * (S - alpha) / (S * S * (S + 1)), dim=1)
+        
+        annealing_coef = min(1.0, epoch / (num_epochs * annealing_step))
+        
+        kl_alpha = (alpha - 1) * (1 - y) + 1
+        kl_term = annealing_coef * self.kl_divergence(kl_alpha, num_classes=alpha.shape[1])
+        
+        loss = A + kl_term
+        
+        return loss.mean()
+    
+    def kl_divergence(self, alpha, num_classes):
+        beta = torch.ones_like(alpha)
+        S_alpha = torch.sum(alpha, dim=1, keepdim=True)
+        S_beta = num_classes
+        
+        lnB_alpha = torch.lgamma(S_alpha) - torch.sum(torch.lgamma(alpha), dim=1, keepdim=True)
+        lnB_beta = torch.lgamma(torch.tensor(S_beta)) - num_classes * torch.lgamma(torch.tensor(1.0))
+        
+        dg0 = torch.digamma(S_alpha)
+        dg1 = torch.digamma(alpha)
+        
+        kl = lnB_alpha - lnB_beta + torch.sum((alpha - beta) * (dg1 - dg0), dim=1, keepdim=True)
+        
+        return kl.squeeze()
+
+
+class AdversarialAttack:
+    def __init__(self, model, epsilon=0.01, alpha=0.001, num_iter=10):
+        self.model = model
+        self.epsilon = epsilon
+        self.alpha = alpha
+        self.num_iter = num_iter
+    
+    def fgsm_attack(self, waveform, label, targeted=False):
+        waveform_adv = waveform.clone().detach().requires_grad_(True)
+        
+        output, _, _ = self.model(waveform_adv)
+        loss = F.cross_entropy(output, label)
+        
+        self.model.zero_grad()
+        loss.backward()
+        
+        if targeted:
+            waveform_adv = waveform_adv - self.epsilon * waveform_adv.grad.sign()
+        else:
+            waveform_adv = waveform_adv + self.epsilon * waveform_adv.grad.sign()
+        
+        waveform_adv = torch.clamp(waveform_adv, waveform.min(), waveform.max())
+        
+        return waveform_adv.detach()
+    
+    def pgd_attack(self, waveform, label):
+        waveform_adv = waveform.clone().detach()
+        
+        for _ in range(self.num_iter):
+            waveform_adv.requires_grad = True
+            
+            output, _, _ = self.model(waveform_adv)
+            loss = F.cross_entropy(output, label)
+            
+            self.model.zero_grad()
+            loss.backward()
+            
+            waveform_adv = waveform_adv + self.alpha * waveform_adv.grad.sign()
+            
+            eta = torch.clamp(waveform_adv - waveform, -self.epsilon, self.epsilon)
+            waveform_adv = torch.clamp(waveform + eta, waveform.min(), waveform.max()).detach()
+        
+        return waveform_adv
+    
+    def carlini_wagner_attack(self, waveform, label, c=1.0, kappa=0):
+        waveform_tanh = torch.atanh(torch.clamp(waveform.clone(), -0.999, 0.999))
+        delta = torch.zeros_like(waveform_tanh, requires_grad=True)
+        
+        optimizer = torch.optim.Adam([delta], lr=0.01)
+        
+        for _ in range(self.num_iter):
+            waveform_adv = torch.tanh(waveform_tanh + delta)
+            
+            output, _, _ = self.model(waveform_adv)
+            
+            real_logit = output[0, label]
+            other_logit = torch.max(output[0, [i for i in range(output.shape[1]) if i != label]])
+            
+            f_loss = torch.clamp(real_logit - other_logit + kappa, min=0)
+            l2_loss = torch.norm(waveform_adv - waveform, p=2)
+            
+            loss = l2_loss + c * f_loss
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        
+        return torch.tanh(waveform_tanh + delta).detach()
+
+
+class RobustnessEvaluator:
+    def __init__(self, model, device='cuda'):
+        self.model = model
+        self.device = device
+        self.model.eval()
+    
+    def evaluate_noise_robustness(self, dataloader, noise_levels=[0.01, 0.05, 0.1]):
+        results = {}
+        
+        for noise_level in noise_levels:
+            correct = 0
+            total = 0
+            
+            with torch.no_grad():
+                for batch in dataloader:
+                    waveforms = batch['waveform'].to(self.device)
+                    labels = batch['label'].to(self.device)
+                    
+                    noise = torch.randn_like(waveforms) * noise_level
+                    waveforms_noisy = waveforms + noise
+                    
+                    outputs, _, _ = self.model(waveforms_noisy)
+                    preds = torch.argmax(outputs, dim=1)
+                    
+                    correct += (preds == labels).sum().item()
+                    total += labels.size(0)
+            
+            accuracy = correct / total
+            results[f'noise_{noise_level}'] = accuracy
+        
+        return results
+    
+    def evaluate_adversarial_robustness(self, dataloader, attack_type='fgsm', epsilon=0.01):
+        attacker = AdversarialAttack(self.model, epsilon=epsilon)
+        
+        correct_clean = 0
+        correct_adv = 0
+        total = 0
+        
+        for batch in dataloader:
+            waveforms = batch['waveform'].to(self.device)
+            labels = batch['label'].to(self.device)
+            
+            with torch.no_grad():
+                outputs_clean, _, _ = self.model(waveforms)
+                preds_clean = torch.argmax(outputs_clean, dim=1)
+                correct_clean += (preds_clean == labels).sum().item()
+            
+            if attack_type == 'fgsm':
+                waveforms_adv = attacker.fgsm_attack(waveforms, labels)
+            elif attack_type == 'pgd':
+                waveforms_adv = attacker.pgd_attack(waveforms, labels)
+            else:
+                waveforms_adv = waveforms
+            
+            with torch.no_grad():
+                outputs_adv, _, _ = self.model(waveforms_adv)
+                preds_adv = torch.argmax(outputs_adv, dim=1)
+                correct_adv += (preds_adv == labels).sum().item()
+            
+            total += labels.size(0)
+        
+        return {
+            'clean_accuracy': correct_clean / total,
+            'adversarial_accuracy': correct_adv / total,
+            'robustness_gap': (correct_clean - correct_adv) / total
+        }
+    
+    def evaluate_compression_robustness(self, dataloader, compression_ratios=[2, 4, 8]):
+        results = {}
+        
+        for ratio in compression_ratios:
+            correct = 0
+            total = 0
+            
+            with torch.no_grad():
+                for batch in dataloader:
+                    waveforms = batch['waveform'].to(self.device)
+                    labels = batch['label'].to(self.device)
+                    
+                    compressed = waveforms[:, ::ratio]
+                    upsampled = F.interpolate(
+                        compressed.unsqueeze(1),
+                        size=waveforms.shape[1],
+                        mode='linear'
+                    ).squeeze(1)
+                    
+                    outputs, _, _ = self.model(upsampled)
+                    preds = torch.argmax(outputs, dim=1)
+                    
+                    correct += (preds == labels).sum().item()
+                    total += labels.size(0)
+            
+            accuracy = correct / total
+            results[f'compression_{ratio}x'] = accuracy
+        
+        return results
+
+
+class FeatureVisualization:
+    def __init__(self, model, device='cuda'):
+        self.model = model
+        self.device = device
+        self.activations = {}
+        self.gradients = {}
+    
+    def register_hooks(self, layer_names):
+        def forward_hook(name):
+            def hook(module, input, output):
+                self.activations[name] = output.detach()
+            return hook
+        
+        def backward_hook(name):
+            def hook(module, grad_input, grad_output):
+                self.gradients[name] = grad_output[0].detach()
+            return hook
+        
+        for name, module in self.model.named_modules():
+            if name in layer_names:
+                module.register_forward_hook(forward_hook(name))
+                module.register_backward_hook(backward_hook(name))
+    
+    def generate_grad_cam(self, waveform, target_class, target_layer):
+        self.model.eval()
+        waveform.requires_grad = True
+        
+        output, _, _ = self.model(waveform)
+        
+        self.model.zero_grad()
+        class_score = output[0, target_class]
+        class_score.backward()
+        
+        gradients = self.gradients[target_layer]
+        activations = self.activations[target_layer]
+        
+        weights = torch.mean(gradients, dim=(2, 3), keepdim=True)
+        cam = torch.sum(weights * activations, dim=1, keepdim=True)
+        cam = F.relu(cam)
+        cam = F.interpolate(cam, size=waveform.shape[-1], mode='linear')
+        
+        cam = cam - cam.min()
+        cam = cam / (cam.max() + 1e-8)
+        
+        return cam.squeeze().cpu().numpy()
+    
+    def compute_saliency_map(self, waveform, target_class):
+        self.model.eval()
+        waveform.requires_grad = True
+        
+        output, _, _ = self.model(waveform)
+        
+        self.model.zero_grad()
+        class_score = output[0, target_class]
+        class_score.backward()
+        
+        saliency = waveform.grad.abs()
+        
+        return saliency.squeeze().cpu().numpy()
+    
+    def compute_integrated_gradients(self, waveform, target_class, baseline=None, steps=50):
+        if baseline is None:
+            baseline = torch.zeros_like(waveform)
+        
+        scaled_inputs = [baseline + (float(i) / steps) * (waveform - baseline) for i in range(steps + 1)]
+        
+        grads = []
+        for scaled_input in scaled_inputs:
+            scaled_input.requires_grad = True
+            output, _, _ = self.model(scaled_input)
+            
+            self.model.zero_grad()
+            class_score = output[0, target_class]
+            class_score.backward()
+            
+            grads.append(scaled_input.grad)
+        
+        avg_grads = torch.stack(grads).mean(dim=0)
+        integrated_grads = (waveform - baseline) * avg_grads
+        
+        return integrated_grads.squeeze().cpu().numpy()
+
+
+class KnowledgeDistillation:
+    def __init__(self, teacher_model, student_model, temperature=3.0, alpha=0.5):
+        self.teacher_model = teacher_model
+        self.student_model = student_model
+        self.temperature = temperature
+        self.alpha = alpha
+        
+        self.teacher_model.eval()
+    
+    def distillation_loss(self, student_outputs, teacher_outputs, labels):
+        soft_targets = F.softmax(teacher_outputs / self.temperature, dim=1)
+        soft_predictions = F.log_softmax(student_outputs / self.temperature, dim=1)
+        
+        distillation_loss = F.kl_div(
+            soft_predictions,
+            soft_targets,
+            reduction='batchmean'
+        ) * (self.temperature ** 2)
+        
+        hard_loss = F.cross_entropy(student_outputs, labels)
+        
+        total_loss = self.alpha * distillation_loss + (1 - self.alpha) * hard_loss
+        
+        return total_loss
+    
+    def train_step(self, waveforms, labels):
+        with torch.no_grad():
+            teacher_outputs, _, _ = self.teacher_model(waveforms)
+        
+        student_outputs, _, _ = self.student_model(waveforms)
+        
+        loss = self.distillation_loss(student_outputs, teacher_outputs, labels)
+        
+        return loss
+
+
+class DataAugmentationScheduler:
+    def __init__(self, initial_strength=0.5, final_strength=1.0, warmup_epochs=10, total_epochs=100):
+        self.initial_strength = initial_strength
+        self.final_strength = final_strength
+        self.warmup_epochs = warmup_epochs
+        self.total_epochs = total_epochs
+    
+    def get_strength(self, epoch):
+        if epoch < self.warmup_epochs:
+            strength = self.initial_strength + (self.final_strength - self.initial_strength) * (epoch / self.warmup_epochs)
+        else:
+            strength = self.final_strength
+        
+        return strength
+    
+    def apply_scheduled_augmentation(self, waveform, epoch, augmentation_func):
+        strength = self.get_strength(epoch)
+        
+        if np.random.rand() < strength:
+            return augmentation_func(waveform)
+        else:
+            return waveform
+
+
+class AdvancedOptimizers:
+    @staticmethod
+    def get_sam_optimizer(model, base_optimizer_class=torch.optim.SGD, rho=0.05, **kwargs):
+        class SAM(torch.optim.Optimizer):
+            def __init__(self, params, base_optimizer, rho=0.05):
+                defaults = dict(rho=rho)
+                super(SAM, self).__init__(params, defaults)
+                
+                self.base_optimizer = base_optimizer(self.param_groups, **kwargs)
+                self.param_groups = self.base_optimizer.param_groups
+            
+            @torch.no_grad()
+            def first_step(self, zero_grad=False):
+                grad_norm = self._grad_norm()
+                for group in self.param_groups:
+                    scale = group['rho'] / (grad_norm + 1e-12)
+                    
+                    for p in group['params']:
+                        if p.grad is None:
+                            continue
+                        e_w = p.grad * scale
+                        p.add_(e_w)
+                        self.state[p]['e_w'] = e_w
+                
+                if zero_grad:
+                    self.zero_grad()
+            
+            @torch.no_grad()
+            def second_step(self, zero_grad=False):
+                for group in self.param_groups:
+                    for p in group['params']:
+                        if p.grad is None:
+                            continue
+                        p.sub_(self.state[p]['e_w'])
+                
+                self.base_optimizer.step()
+                
+                if zero_grad:
+                    self.zero_grad()
+            
+            def _grad_norm(self):
+                shared_device = self.param_groups[0]['params'][0].device
+                norm = torch.norm(
+                    torch.stack([
+                        p.grad.norm(p=2).to(shared_device)
+                        for group in self.param_groups
+                        for p in group['params']
+                        if p.grad is not None
+                    ]),
+                    p=2
+                )
+                return norm
+        
+        return SAM(model.parameters(), base_optimizer_class, rho=rho)
+    
+    @staticmethod
+    def get_lookahead_optimizer(base_optimizer, k=5, alpha=0.5):
+        class Lookahead(torch.optim.Optimizer):
+            def __init__(self, optimizer, k=5, alpha=0.5):
+                self.optimizer = optimizer
+                self.k = k
+                self.alpha = alpha
+                self.param_groups = self.optimizer.param_groups
+                self.state = defaultdict(dict)
+                self.fast_state = self.optimizer.state
+                
+                for group in self.param_groups:
+                    group['counter'] = 0
+            
+            def update(self, group):
+                for fast in group['params']:
+                    param_state = self.state[fast]
+                    if 'slow_param' not in param_state:
+                        param_state['slow_param'] = torch.zeros_like(fast.data)
+                        param_state['slow_param'].copy_(fast.data)
+                    slow = param_state['slow_param']
+                    slow += (fast.data - slow) * self.alpha
+                    fast.data.copy_(slow)
+            
+            def step(self, closure=None):
+                loss = self.optimizer.step(closure)
+                for group in self.param_groups:
+                    if group['counter'] == 0:
+                        self.update(group)
+                    group['counter'] += 1
+                    if group['counter'] >= self.k:
+                        group['counter'] = 0
+                return loss
+        
+        return Lookahead(base_optimizer, k=k, alpha=alpha)
+
+
+class AdvancedSchedulers:
+    @staticmethod
+    def get_cosine_with_warmup(optimizer, num_warmup_steps, num_training_steps, num_cycles=0.5):
+        def lr_lambda(current_step):
+            if current_step < num_warmup_steps:
+                return float(current_step) / float(max(1, num_warmup_steps))
+            progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+            return max(0.0, 0.5 * (1.0 + np.cos(np.pi * float(num_cycles) * 2.0 * progress)))
+        
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    
+    @staticmethod
+    def get_polynomial_decay(optimizer, num_training_steps, power=1.0, min_lr=0.0):
+        def lr_lambda(current_step):
+            if current_step >= num_training_steps:
+                return min_lr
+            return ((1 - current_step / num_training_steps) ** power) * (1 - min_lr) + min_lr
+        
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    
+    @staticmethod
+    def get_cyclic_cosine(optimizer, base_lr, max_lr, step_size_up=2000, cycle_momentum=False):
+        return torch.optim.lr_scheduler.CyclicLR(
+            optimizer,
+            base_lr=base_lr,
+            max_lr=max_lr,
+            step_size_up=step_size_up,
+            mode='triangular2',
+            cycle_momentum=cycle_momentum
+        )
+
+
+class BalancedBatchSampler(torch.utils.data.Sampler):
+    def __init__(self, dataset, batch_size, num_batches_per_epoch=None):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        
+        self.class_indices = defaultdict(list)
+        for idx in range(len(dataset)):
+            label = dataset[idx]['label']
+            self.class_indices[label].append(idx)
+        
+        self.num_classes = len(self.class_indices)
+        self.samples_per_class = batch_size // self.num_classes
+        
+        if num_batches_per_epoch is None:
+            min_class_size = min(len(indices) for indices in self.class_indices.values())
+            self.num_batches = min_class_size // self.samples_per_class
+        else:
+            self.num_batches = num_batches_per_epoch
+    
+    def __iter__(self):
+        for _ in range(self.num_batches):
+            batch = []
+            for class_id in self.class_indices:
+                indices = np.random.choice(
+                    self.class_indices[class_id],
+                    size=self.samples_per_class,
+                    replace=False
+                )
+                batch.extend(indices)
+            
+            np.random.shuffle(batch)
+            yield  batch
+    
+    def __len__(self):
+        return self.num_batches
+
+
+class DomainBalancedBatchSampler(torch.utils.data.Sampler):
+    def __init__(self, dataset, batch_size, domain_column='domain_distance'):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.domain_column = domain_column
+        
+        self.domain_indices = defaultdict(list)
+        for idx in range(len(dataset)):
+            domain_val = dataset.df.iloc[idx][domain_column]
+            self.domain_indices[domain_val].append(idx)
+        
+        self.num_domains = len(self.domain_indices)
+        self.samples_per_domain = max(1, batch_size // self.num_domains)
+        
+        min_domain_size = min(len(indices) for indices in self.domain_indices.values())
+        self.num_batches = min_domain_size // self.samples_per_domain
+    
+    def __iter__(self):
+        for _ in range(self.num_batches):
+            batch = []
+            for domain_val in self.domain_indices:
+                indices = np.random.choice(
+                    self.domain_indices[domain_val],
+                    size=self.samples_per_domain,
+                    replace=False
+                )
+                batch.extend(indices)
+            
+            if len(batch) < self.batch_size:
+                all_indices = [idx for indices in self.domain_indices.values() for idx in indices]
+                additional = np.random.choice(
+                    all_indices,
+                    size=self.batch_size - len(batch),
+                    replace=False
+                )
+                batch.extend(additional)
+            
+            np.random.shuffle(batch)
+            yield batch[:self.batch_size]
+    
+    def __len__(self):
+        return self.num_batches
+
+
+class CalibrationMetrics:
+    @staticmethod
+    def compute_ece(y_true, y_prob, n_bins=10):
+        bin_boundaries = np.linspace(0, 1, n_bins + 1)
+        bin_lowers = bin_boundaries[:-1]
+        bin_uppers = bin_boundaries[1:]
+        
+        ece = 0.0
+        for bin_lower, bin_upper in zip(bin_lowers, bin_uppers):
+            in_bin = (y_prob > bin_lower) & (y_prob <= bin_upper)
+            prop_in_bin = in_bin.mean()
+            
+            if prop_in_bin > 0:
+                accuracy_in_bin = y_true[in_bin].mean()
+                avg_confidence_in_bin = y_prob[in_bin].mean()
+                ece += np.abs(avg_confidence_in_bin - accuracy_in_bin) * prop_in_bin
+        
+        return ece
+    
+    @staticmethod
+    def compute_mce(y_true, y_prob, n_bins=10):
+        bin_boundaries = np.linspace(0, 1, n_bins + 1)
+        bin_lowers = bin_boundaries[:-1]
+        bin_uppers = bin_boundaries[1:]
+        
+        ce_values = []
+        for bin_lower, bin_upper in zip(bin_lowers, bin_uppers):
+            in_bin = (y_prob > bin_lower) & (y_prob <= bin_upper)
+            
+            if in_bin.sum() > 0:
+                accuracy_in_bin = y_true[in_bin].mean()
+                avg_confidence_in_bin = y_prob[in_bin].mean()
+                ce_values.append(np.abs(avg_confidence_in_bin - accuracy_in_bin))
+        
+        if ce_values:
+            mce = max(ce_values)
+        else:
+            mce = 0.0
+        
+        return mce
+    
+    @staticmethod
+    def compute_brier_score(y_true, y_prob):
+        return np.mean((y_prob - y_true) ** 2)
+    
+    @staticmethod
+    def reliability_diagram_data(y_true, y_prob, n_bins=10):
+        bin_boundaries = np.linspace(0, 1, n_bins + 1)
+        bin_lowers = bin_boundaries[:-1]
+        bin_uppers = bin_boundaries[1:]
+        
+        bin_centers = []
+        bin_accuracies = []
+        bin_counts = []
+        
+        for bin_lower, bin_upper in zip(bin_lowers, bin_uppers):
+            in_bin = (y_prob > bin_lower) & (y_prob <= bin_upper)
+            
+            if in_bin.sum() > 0:
+                bin_centers.append((bin_lower + bin_upper) / 2)
+                bin_accuracies.append(y_true[in_bin].mean())
+                bin_counts.append(in_bin.sum())
+        
+        return {
+            'bin_centers': np.array(bin_centers),
+            'bin_accuracies': np.array(bin_accuracies),
+            'bin_counts': np.array(bin_counts)
+        }
+
+
+class TemperatureScaling:
+    def __init__(self):
+        self.temperature = nn.Parameter(torch.ones(1) * 1.5)
+    
+    def calibrate(self, logits, labels, max_iter=50, lr=0.01):
+        nll_criterion = nn.CrossEntropyLoss()
+        optimizer = torch.optim.LBFGS([self.temperature], lr=lr, max_iter=max_iter)
+        
+        def eval():
+            loss = nll_criterion(self.forward(logits), labels)
+            loss.backward()
+            return loss
+        
+        optimizer.step(eval)
+        
+        return self.temperature.item()
+    
+    def forward(self, logits):
+        return logits / self.temperature
+
+
+class IsotonicCalibration:
+    def __init__(self):
+        from sklearn.isotonic import IsotonicRegression
+        self.calibrator = IsotonicRegression(out_of_bounds='clip')
+    
+    def fit(self, y_prob, y_true):
+        self.calibrator.fit(y_prob, y_true)
+    
+    def transform(self, y_prob):
+        return self.calibrator.predict(y_prob)
+
+
+class PlatScaling:
+    def __init__(self, num_classes=2):
+        self.num_classes = num_classes
+        self.linear = nn.Linear(num_classes, num_classes, bias=True)
+    
+    def calibrate(self, logits, labels, max_iter=50, lr=0.01):
+        nll_criterion = nn.CrossEntropyLoss()
+        optimizer = torch.optim.LBFGS(self.linear.parameters(), lr=lr, max_iter=max_iter)
+        
+        def eval():
+            loss = nll_criterion(self.forward(logits), labels)
+            loss.backward()
+            return loss
+        
+        optimizer.step(eval)
+    
+    def forward(self, logits):
+        return self.linear(logits)
+
+
+class EnsembleStrategies:
+    @staticmethod
+    def average_ensemble(predictions_list):
+        return torch.stack(predictions_list).mean(dim=0)
+    
+    @staticmethod
+    def weighted_ensemble(predictions_list, weights):
+        weights = torch.softmax(torch.tensor(weights), dim=0)
+        weighted_preds = torch.stack(predictions_list) * weights.view(-1, 1, 1)
+        return weighted_preds.sum(dim=0)
+    
+    @staticmethod
+    def majority_voting(predictions_list):
+        votes = torch.stack([torch.argmax(pred, dim=1) for pred in predictions_list])
+        majority = torch.mode(votes, dim=0).values
+        return F.one_hot(majority, num_classes=predictions_list[0].shape[1]).float()
+    
+    @staticmethod
+    def stacking_ensemble(predictions_list, meta_learner):
+        stacked = torch.cat(predictions_list, dim=1)
+        return meta_learner(stacked)
+    
+    @staticmethod
+    def boosting_weights(models, val_loader, device='cuda'):
+        weights = []
+        
+        for model in models:
+            model.eval()
+            correct = 0
+            total = 0
+            
+            with torch.no_grad():
+                for batch in val_loader:
+                    waveforms = batch['waveform'].to(device)
+                    labels = batch['label'].to(device)
+                    
+                    outputs, _, _ = model(waveforms)
+                    preds = torch.argmax(outputs, dim=1)
+                    
+                    correct += (preds == labels).sum().item()
+                    total += labels.size(0)
+            
+            accuracy = correct / total
+            weight = np.log(accuracy / (1 - accuracy + 1e-10))
+            weights.append(weight)
+        
+        weights = np.array(weights)
+        weights = weights / weights.sum()
+        
+        return weights.tolist()
+
+
+class ProgressiveResizing:
+    def __init__(self, initial_size=24000, final_size=48000, num_stages=4):
+        self.initial_size = initial_size
+        self.final_size = final_size
+        self.num_stages = num_stages
+        
+        self.sizes = np.linspace(initial_size, final_size, num_stages).astype(int)
+    
+    def get_size_for_epoch(self, epoch, epochs_per_stage):
+        stage = min(epoch // epochs_per_stage, self.num_stages - 1)
+        return self.sizes[stage]
+    
+    def resize_waveform(self, waveform, target_size):
+        if waveform.shape[-1] == target_size:
+            return waveform
+        
+        return F.interpolate(
+            waveform.unsqueeze(0).unsqueeze(0),
+            size=target_size,
+            mode='linear'
+        ).squeeze()
+
+
+class MixupCutmixStrategies:
+    @staticmethod
+    def mixup(x, y, alpha=1.0):
+        if alpha > 0:
+            lam = np.random.beta(alpha, alpha)
+        else:
+            lam = 1
+        
+        batch_size = x.size(0)
+        index = torch.randperm(batch_size).to(x.device)
+        
+        mixed_x = lam * x + (1 - lam) * x[index]
+        y_a, y_b = y, y[index]
+        
+        return mixed_x, y_a, y_b, lam
+    
+    @staticmethod
+    def cutmix(x, y, alpha=1.0):
+        if alpha > 0:
+            lam = np.random.beta(alpha, alpha)
+        else:
+            lam = 1
+        
+        batch_size = x.size(0)
+        index = torch.randperm(batch_size).to(x.device)
+        
+        cut_len = int(x.size(1) * (1 - lam))
+        cut_start = np.random.randint(0, x.size(1) - cut_len)
+        
+        x[:, cut_start:cut_start + cut_len] = x[index, cut_start:cut_start + cut_len]
+        
+        lam = 1 - cut_len / x.size(1)
+        y_a, y_b = y, y[index]
+        
+        return x, y_a, y_b, lam
+    
+    @staticmethod
+    def fmix(x, y, alpha=1.0, decay_power=3, shape=(48000,)):
+        lam = np.random.beta(alpha, alpha)
+        
+        fft_x = np.fft.fft(np.random.uniform(size=shape))
+        fft_x *= np.random.uniform(size=shape) ** decay_power
+        
+        mask = np.fft.ifft(fft_x).real
+        mask = (mask - mask.min()) / (mask.max() - mask.min())
+        mask = (mask > (1 - lam)).astype(np.float32)
+        
+        mask = torch.from_numpy(mask).to(x.device)
+        
+        batch_size = x.size(0)
+        index = torch.randperm(batch_size).to(x.device)
+        
+        mixed_x = x * mask + x[index] * (1 - mask)
+        y_a, y_b = y, y[index]
+        
+        lam = mask.mean().item()
+        
+        return mixed_x, y_a, y_b, lam
